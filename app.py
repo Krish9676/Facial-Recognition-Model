@@ -155,16 +155,37 @@ def extract_face_embedding(image_pil):
         print(f"❌ Face embedding extraction failed: {e}")
         return None
 
+# def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
+#     """Determine if faces match"""
+#     try:
+#         distance = np.linalg.norm(np.array(embedding1) - np.array(embedding2))
+#         is_match = distance <= threshold
+#         confidence = (1 - (distance / threshold)) * 100 if distance <= threshold else 0
+#         return is_match, distance, round(confidence, 2)
+#     except Exception as e:
+#         print(f"❌ Face matching failed: {e}")
+#         return False, None, 0
+
 def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
     """Determine if faces match"""
     try:
-        distance = np.linalg.norm(np.array(embedding1) - np.array(embedding2))
-        is_match = distance <= threshold
-        confidence = (1 - (distance / threshold)) * 100 if distance <= threshold else 0
+        distance = float(np.linalg.norm(np.array(embedding1) - np.array(embedding2)))
+        is_match = bool(distance <= threshold)
+        confidence = float((1 - (distance / threshold)) * 100) if is_match else 0.0
         return is_match, distance, round(confidence, 2)
     except Exception as e:
         print(f"❌ Face matching failed: {e}")
-        return False, None, 0
+        return False, None, 0.0
+
+def to_serializable(obj):
+    if isinstance(obj, (np.bool_, np.bool)):
+        return bool(obj)
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    return obj
+
 
 # ====================================================================
 # ROUTES
@@ -289,21 +310,36 @@ def verify_farmer():
         
         # Compare faces
         is_match, distance, confidence = is_face_match(stored_embedding, uploaded_embedding)
-        
+
         print(f"📊 {'✅ MATCH' if is_match else '❌ NO MATCH'} (confidence: {confidence}%)")
-        
+
         # Convert NumPy types to native Python types for JSON serialization
-        return jsonify({
-            "verified": bool(is_match),
-            "confidence": float(confidence) if confidence is not None else 0.0,
-            "distance": float(round(distance, 4)) if distance is not None else None,
+        response_dict = {
+            "verified": is_match,
+            "confidence": confidence,
+            "distance": distance,
             "threshold": float(MATCH_THRESHOLD),
             "farm_name": str(farm_name),
             "rsbsa_no": str(rsbsa_no),
             "farmer_name": str(farmer.get('name', 'N/A')),
             "message": "Identity verified successfully" if is_match else "Identity verification failed",
             "verified_at": datetime.utcnow().isoformat() + "Z"
-        }), 200
+        }
+
+        # Use serialization helper to handle NumPy types
+        return jsonify({k: to_serializable(v) for k, v in response_dict.items()}), 200
+
+        # return jsonify({
+        #     "verified": bool(is_match),
+        #     "confidence": float(confidence) if confidence is not None else 0.0,
+        #     "distance": float(round(distance, 4)) if distance is not None else None,
+        #     "threshold": float(MATCH_THRESHOLD),
+        #     "farm_name": str(farm_name),
+        #     "rsbsa_no": str(rsbsa_no),
+        #     "farmer_name": str(farmer.get('name', 'N/A')),
+        #     "message": "Identity verified successfully" if is_match else "Identity verification failed",
+        #     "verified_at": datetime.utcnow().isoformat() + "Z"
+        # }), 200
         
     except Exception as e:
         print(f"❌ Error: {str(e)}")
