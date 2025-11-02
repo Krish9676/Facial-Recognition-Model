@@ -31,17 +31,14 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"✅ Using device: {device}")
 
 # ====================================================================
-# GLOBAL DATABASE VARIABLES
+# DATABASE INITIALIZATION - RUNS AT MODULE IMPORT
 # ====================================================================
 mongo_client = None
 db = None
 collection = None
 
-# ====================================================================
-# DATABASE INITIALIZATION - MATCHES YOUR LOCAL CODE
-# ====================================================================
 def initialize_database():
-    """Initialize MongoDB connection - returns (client, db, collection)"""
+    """Initialize MongoDB connection"""
     global mongo_client, db, collection
     
     try:
@@ -55,24 +52,35 @@ def initialize_database():
         client.admin.command('ping')
         print("✅ MongoDB server connection successful")
         
-        # Use the correct database name
+        # Set database and collection
         db = client[MONGODB_DB_NAME]
         collection = db[MONGODB_COLLECTION]
-        
-        # Update globals
         mongo_client = client
         
         # Count documents
-        count = collection.count_documents({})
-        print(f"✅ Connected to database '{MONGODB_DB_NAME}'")
-        print(f"✅ Collection '{MONGODB_COLLECTION}' has {count} farmers")
+        try:
+            count = collection.count_documents({})
+            print(f"✅ Connected to database '{MONGODB_DB_NAME}'")
+            print(f"✅ Collection '{MONGODB_COLLECTION}' has {count} farmers")
+        except Exception as e:
+            print(f"⚠️ Connected but couldn't count documents: {e}")
         
-        return client, db, collection
+        return True
         
     except Exception as e:
         print(f"❌ MongoDB connection failed: {e}")
+        print(f"❌ Error details: {type(e).__name__}: {str(e)}")
         mongo_client = db = collection = None
-        return None, None, None
+        return False
+
+# 🔥 CRITICAL: Initialize database when module loads (for Gunicorn)
+print("🚀 Initializing database at module load...")
+db_initialized = initialize_database()
+if not db_initialized:
+    print("❌ WARNING: Database initialization failed!")
+    print("❌ The /verify endpoint will not work until DB is connected")
+else:
+    print("✅ Database initialization complete")
 
 # ====================================================================
 # UTILITY FUNCTIONS
@@ -113,7 +121,7 @@ def decode_uploaded_photo(base64_string):
         return None
 
 def extract_face_embedding(image_pil):
-    """Extract 512-dimensional face embedding using FaceNet (lazy-load)"""
+    """Extract face embedding (lazy-load models)"""
     try:
         from facenet_pytorch import MTCNN, InceptionResnetV1
         
@@ -131,7 +139,6 @@ def extract_face_embedding(image_pil):
         
         face_tensor = mtcnn(image_pil)
         if face_tensor is None:
-            print("❌ No face detected in image")
             return None
         
         with torch.no_grad():
@@ -150,7 +157,7 @@ def extract_face_embedding(image_pil):
         return None
 
 def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
-    """Determine if faces match based on distance threshold"""
+    """Determine if faces match"""
     try:
         distance = np.linalg.norm(np.array(embedding1) - np.array(embedding2))
         is_match = distance <= threshold
@@ -171,6 +178,7 @@ def health_check():
         "service": "Farmer Facial Recognition API",
         "version": "1.0",
         "device": str(device),
+        "database_connected": collection is not None,
         "timestamp": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -178,25 +186,37 @@ def health_check():
 def health():
     """Detailed health check"""
     db_status = "connected" if collection is not None else "disconnected"
+    
+    # Try to get document count if connected
+    doc_count = None
+    if collection is not None:
+        try:
+            doc_count = collection.count_documents({})
+        except Exception as e:
+            print(f"Error counting documents: {e}")
+    
     return jsonify({
         "status": "healthy",
         "database": db_status,
-        "device": str(device)
+        "document_count": doc_count,
+        "device": str(device),
+        "mongodb_uri_set": bool(MONGODB_URI and MONGODB_URI != 'mongodb://localhost:27017/')
     })
 
 @app.route('/verify', methods=['POST'])
 def verify_farmer():
     """Verify farmer identity using facial recognition"""
+    
+    # Check database connection first
+    if collection is None:
+        print("❌ Database not initialized when /verify called")
+        return jsonify({
+            "verified": False,
+            "message": "Database not initialized. Please check server logs and MongoDB connection.",
+            "error_code": "DB_NOT_INITIALIZED"
+        }), 500
+    
     try:
-        # Check if database is initialized
-        if collection is None:
-            print("❌ Database not initialized when /verify called")
-            return jsonify({
-                "verified": False,
-                "message": "Database not initialized",
-                "error_code": "DB_NOT_INITIALIZED"
-            }), 500
-        
         data = request.get_json()
         
         if not data:
@@ -211,9 +231,9 @@ def verify_farmer():
                 "error": "Missing required fields: photo, farm_name, rsbsa_no"
             }), 400
         
-        print(f"\n🔍 Searching for farmer:")
-        print(f"  Farm Name: {farm_name}")
-        print(f"  RSBSA No: {rsbsa_no}")
+        print(f"\n🔍 Verifying farmer:")
+        print(f"  Farm: {farm_name}")
+        print(f"  RSBSA: {rsbsa_no}")
         
         # Query database
         farmer = collection.find_one({
@@ -222,14 +242,14 @@ def verify_farmer():
         })
         
         if not farmer:
-            print("❌ Farmer not found with exact match")
+            print("❌ Farmer not found")
             return jsonify({
                 "verified": False,
                 "message": "Farmer not found in database",
                 "error_code": "FARMER_NOT_FOUND"
             }), 404
         
-        print(f"✅ Farmer found: {farmer.get('name', 'N/A')}")
+        print(f"✅ Found: {farmer.get('name', 'N/A')}")
         
         if 'encryptedData' not in farmer or 'encryptedContent' not in farmer['encryptedData']:
             return jsonify({
@@ -275,11 +295,7 @@ def verify_farmer():
         # Compare faces
         is_match, distance, confidence = is_face_match(stored_embedding, uploaded_embedding)
         
-        print(f"\n📊 VERIFICATION RESULTS:")
-        print(f"  Distance: {distance:.4f}" if distance else "  Distance: N/A")
-        print(f"  Threshold: {MATCH_THRESHOLD}")
-        print(f"  Confidence: {confidence}%")
-        print(f"  Match: {'✅ YES' if is_match else '❌ NO'}")
+        print(f"📊 Result: {'✅ MATCH' if is_match else '❌ NO MATCH'} (confidence: {confidence}%)")
         
         return jsonify({
             "verified": is_match,
@@ -289,12 +305,14 @@ def verify_farmer():
             "farm_name": farm_name,
             "rsbsa_no": rsbsa_no,
             "farmer_name": farmer.get('name', 'N/A'),
-            "message": "✅ Identity verified - Match confirmed!" if is_match else "❌ Identity verification failed - Not a match",
+            "message": "Identity verified successfully" if is_match else "Identity verification failed",
             "verified_at": datetime.utcnow().isoformat() + "Z"
         }), 200
         
     except Exception as e:
         print(f"❌ Error in verify endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "verified": False,
             "message": f"System error: {str(e)}",
@@ -302,57 +320,17 @@ def verify_farmer():
         }), 500
 
 # ====================================================================
-# APP STARTUP - CRITICAL: INITIALIZE DB BEFORE RUNNING
+# FOR LOCAL TESTING ONLY
 # ====================================================================
 if __name__ == '__main__':
-    print("🚀 Farmer Identity Verification System")
-    print("=" * 50)
-    
-    # Initialize database
-    client, db, collection = initialize_database()
+    if collection is None:
+        print("❌ Database not initialized. Attempting to reconnect...")
+        initialize_database()
     
     if collection is None:
-        print("❌ Cannot proceed without database connection")
-        print("❌ Failed to initialize database. Exiting...")
+        print("❌ Still cannot connect to database. Exiting...")
         exit(1)
     
     port = int(os.getenv('PORT', 8080))
-    print(f"🚀 Starting server on port {port}...")
+    print(f"🚀 Starting development server on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-# ## 🔑 Key Changes Made
-
-# 1. **Environment variable check**: Added fallback to check both `MONGODB_URI` and `MONGO_URI` (like your local code)
-# 2. **Global variables properly updated**: The `initialize_database()` function now updates the global `mongo_client`, `db`, and `collection` variables
-# 3. **Better error logging**: Added detailed print statements matching your local code
-# 4. **Explicit None check**: Changed `if collection is None` instead of just `if not collection`
-# 5. **Startup sequence**: Database initialization happens **before** Flask starts (just like your local code)
-
-# ## 🔧 Render Environment Variables Setup
-
-# Make sure you set these in **Render Dashboard → Your Service → Environment**:
-# ```
-# MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/
-# MONGODB_DB_NAME=test
-# MONGODB_COLLECTION=phil_farmers
-# XOR_KEY=MySecretKey123
-# MATCH_THRESHOLD=0.6
-# ```
-
-# ## ✅ Expected Startup Logs
-
-# After deploying, check Render logs. You should see:
-# ```
-# 📋 Configuration:
-#   MongoDB URI: mongodb+srv://...
-#   DB Name: test
-#   Collection: phil_farmers
-# ✅ Using device: cpu
-# 🚀 Farmer Identity Verification System
-# ==================================================
-# 🔗 Connecting to MongoDB...
-# ✅ MongoDB server connection successful
-# ✅ Connected to database 'test'
-# ✅ Collection 'phil_farmers' has 50 farmers
-# 🚀 Starting server on port 8080...
