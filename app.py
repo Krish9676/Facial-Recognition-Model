@@ -31,7 +31,7 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"✅ Using device: {device}")
 
 # ====================================================================
-# DATABASE INITIALIZATION - RUNS AT MODULE IMPORT
+# DATABASE INITIALIZATION
 # ====================================================================
 mongo_client = None
 db = None
@@ -73,12 +73,11 @@ def initialize_database():
         mongo_client = db = collection = None
         return False
 
-# 🔥 CRITICAL: Initialize database when module loads (for Gunicorn)
+# Initialize at module load for Gunicorn
 print("🚀 Initializing database at module load...")
 db_initialized = initialize_database()
 if not db_initialized:
     print("❌ WARNING: Database initialization failed!")
-    print("❌ The /verify endpoint will not work until DB is connected")
 else:
     print("✅ Database initialization complete")
 
@@ -107,7 +106,7 @@ def decrypt_farmer_photo(encrypted_b64_string):
         return None
 
 def decode_uploaded_photo(base64_string):
-    """Decode uploaded base64 (non-encrypted) photo"""
+    """Decode uploaded base64 photo"""
     try:
         if ',' in base64_string:
             base64_string = base64_string.split(',')[1]
@@ -187,7 +186,6 @@ def health():
     """Detailed health check"""
     db_status = "connected" if collection is not None else "disconnected"
     
-    # Try to get document count if connected
     doc_count = None
     if collection is not None:
         try:
@@ -207,12 +205,11 @@ def health():
 def verify_farmer():
     """Verify farmer identity using facial recognition"""
     
-    # Check database connection first
     if collection is None:
-        print("❌ Database not initialized when /verify called")
+        print("❌ Database not initialized")
         return jsonify({
             "verified": False,
-            "message": "Database not initialized. Please check server logs and MongoDB connection.",
+            "message": "Database not initialized",
             "error_code": "DB_NOT_INITIALIZED"
         }), 500
     
@@ -231,9 +228,7 @@ def verify_farmer():
                 "error": "Missing required fields: photo, farm_name, rsbsa_no"
             }), 400
         
-        print(f"\n🔍 Verifying farmer:")
-        print(f"  Farm: {farm_name}")
-        print(f"  RSBSA: {rsbsa_no}")
+        print(f"\n🔍 Verifying: {farm_name} | {rsbsa_no}")
         
         # Query database
         farmer = collection.find_one({
@@ -295,22 +290,23 @@ def verify_farmer():
         # Compare faces
         is_match, distance, confidence = is_face_match(stored_embedding, uploaded_embedding)
         
-        print(f"📊 Result: {'✅ MATCH' if is_match else '❌ NO MATCH'} (confidence: {confidence}%)")
+        print(f"📊 {'✅ MATCH' if is_match else '❌ NO MATCH'} (confidence: {confidence}%)")
         
+        # Convert NumPy types to native Python types for JSON serialization
         return jsonify({
-            "verified": is_match,
-            "confidence": confidence,
-            "distance": round(distance, 4) if distance else None,
-            "threshold": MATCH_THRESHOLD,
-            "farm_name": farm_name,
-            "rsbsa_no": rsbsa_no,
-            "farmer_name": farmer.get('name', 'N/A'),
+            "verified": bool(is_match),
+            "confidence": float(confidence) if confidence is not None else 0.0,
+            "distance": float(round(distance, 4)) if distance is not None else None,
+            "threshold": float(MATCH_THRESHOLD),
+            "farm_name": str(farm_name),
+            "rsbsa_no": str(rsbsa_no),
+            "farmer_name": str(farmer.get('name', 'N/A')),
             "message": "Identity verified successfully" if is_match else "Identity verification failed",
             "verified_at": datetime.utcnow().isoformat() + "Z"
         }), 200
         
     except Exception as e:
-        print(f"❌ Error in verify endpoint: {str(e)}")
+        print(f"❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -320,17 +316,17 @@ def verify_farmer():
         }), 500
 
 # ====================================================================
-# FOR LOCAL TESTING ONLY
+# LOCAL TESTING
 # ====================================================================
 if __name__ == '__main__':
     if collection is None:
-        print("❌ Database not initialized. Attempting to reconnect...")
+        print("❌ Attempting to reconnect...")
         initialize_database()
     
     if collection is None:
-        print("❌ Still cannot connect to database. Exiting...")
+        print("❌ Cannot connect. Exiting...")
         exit(1)
     
     port = int(os.getenv('PORT', 8080))
-    print(f"🚀 Starting development server on port {port}...")
+    print(f"🚀 Starting on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
