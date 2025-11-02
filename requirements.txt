@@ -1,11 +1,9 @@
-
 Flask
 flask-cors
 pymongo
 python-dotenv
 Pillow
 numpy
-torch
-torchvision
+torch==2.2.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 facenet-pytorch
 gunicorn
