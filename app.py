@@ -21,6 +21,7 @@ MONGODB_DB_NAME = os.getenv('MONGODB_DB_NAME', 'test')
 MONGODB_COLLECTION = os.getenv('MONGODB_COLLECTION', 'phil_farmers')
 XOR_KEY = os.getenv('XOR_KEY', 'MySecretKey123')
 MATCH_THRESHOLD = float(os.getenv('MATCH_THRESHOLD', '0.6'))
+MAX_IMAGE_SIZE = (800, 800)  # Resize large images
 
 print(f"📋 Configuration:")
 print(f"  MongoDB URI: {MONGODB_URI[:50] + '...' if MONGODB_URI else 'Not set'}")
@@ -29,6 +30,34 @@ print(f"  Collection: {MONGODB_COLLECTION}")
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"✅ Using device: {device}")
+
+# ====================================================================
+# GLOBAL MODEL INITIALIZATION (CRITICAL OPTIMIZATION)
+# ====================================================================
+print("🔄 Loading face recognition models (one-time initialization)...")
+mtcnn = None
+facenet = None
+
+def initialize_models():
+    """Initialize models ONCE at startup"""
+    global mtcnn, facenet
+    try:
+        mtcnn = MTCNN(
+            image_size=160,
+            margin=0,
+            min_face_size=20,
+            thresholds=[0.6, 0.7, 0.7],
+            factor=0.709,
+            post_process=True,
+            device=device,
+            keep_all=False
+        )
+        facenet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+        print("✅ Models loaded successfully")
+        return True
+    except Exception as e:
+        print(f"❌ Model initialization failed: {e}")
+        return False
 
 # ====================================================================
 # DATABASE INITIALIZATION
@@ -81,9 +110,22 @@ if not db_initialized:
 else:
     print("✅ Database initialization complete")
 
+# Initialize models at startup (CRITICAL)
+models_initialized = initialize_models()
+if not models_initialized:
+    print("❌ WARNING: Model initialization failed!")
+else:
+    print("✅ Model initialization complete")
+
 # ====================================================================
 # UTILITY FUNCTIONS
 # ====================================================================
+def optimize_image(image_pil):
+    """Resize image if too large to speed up processing"""
+    if image_pil.size[0] > MAX_IMAGE_SIZE[0] or image_pil.size[1] > MAX_IMAGE_SIZE[1]:
+        image_pil.thumbnail(MAX_IMAGE_SIZE, Image.LANCZOS)
+    return image_pil
+
 def xor_decrypt(encrypted_data, key):
     """Simple XOR decryption"""
     decrypted = bytearray()
@@ -100,6 +142,7 @@ def decrypt_farmer_photo(encrypted_b64_string):
         image = Image.open(BytesIO(decrypted_bytes))
         if image.mode != 'RGB':
             image = image.convert('RGB')
+        image = optimize_image(image)
         return image
     except Exception as e:
         print(f"❌ Image decryption failed: {e}")
@@ -114,28 +157,21 @@ def decode_uploaded_photo(base64_string):
         image = Image.open(BytesIO(image_bytes))
         if image.mode != 'RGB':
             image = image.convert('RGB')
+        image = optimize_image(image)
         return image
     except Exception as e:
         print(f"❌ Photo decoding failed: {e}")
         return None
 
 def extract_face_embedding(image_pil):
-    """Extract face embedding (lazy-load models)"""
+    """Extract face embedding using pre-loaded models"""
+    global mtcnn, facenet
+    
+    if mtcnn is None or facenet is None:
+        print("❌ Models not initialized")
+        return None
+    
     try:
-        from facenet_pytorch import MTCNN, InceptionResnetV1
-        
-        mtcnn = MTCNN(
-            image_size=160,
-            margin=0,
-            min_face_size=20,
-            thresholds=[0.6, 0.7, 0.7],
-            factor=0.709,
-            post_process=True,
-            device=device,
-            keep_all=False
-        )
-        facenet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-        
         face_tensor = mtcnn(image_pil)
         if face_tensor is None:
             return None
@@ -144,27 +180,11 @@ def extract_face_embedding(image_pil):
             face_tensor = face_tensor.unsqueeze(0).to(device)
             embedding = facenet(face_tensor).cpu().numpy()[0]
         
-        # Free memory
-        del mtcnn, facenet
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
         return embedding
         
     except Exception as e:
         print(f"❌ Face embedding extraction failed: {e}")
         return None
-
-# def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
-#     """Determine if faces match"""
-#     try:
-#         distance = np.linalg.norm(np.array(embedding1) - np.array(embedding2))
-#         is_match = distance <= threshold
-#         confidence = (1 - (distance / threshold)) * 100 if distance <= threshold else 0
-#         return is_match, distance, round(confidence, 2)
-#     except Exception as e:
-#         print(f"❌ Face matching failed: {e}")
-#         return False, None, 0
 
 def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
     """Determine if faces match"""
@@ -176,16 +196,6 @@ def is_face_match(embedding1, embedding2, threshold=MATCH_THRESHOLD):
     except Exception as e:
         print(f"❌ Face matching failed: {e}")
         return False, None, 0.0
-
-# def to_serializable(obj):
-#     if isinstance(obj, (np.bool_, np.bool)):
-#         return bool(obj)
-#     if isinstance(obj, (np.integer, np.int32, np.int64)):
-#         return int(obj)
-#     if isinstance(obj, (np.floating, np.float32, np.float64)):
-#         return float(obj)
-#     return obj
-
 
 # ====================================================================
 # ROUTES
@@ -199,6 +209,7 @@ def health_check():
         "version": "1.0",
         "device": str(device),
         "database_connected": collection is not None,
+        "models_loaded": mtcnn is not None and facenet is not None,
         "timestamp": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -206,6 +217,7 @@ def health_check():
 def health():
     """Detailed health check"""
     db_status = "connected" if collection is not None else "disconnected"
+    model_status = "loaded" if (mtcnn is not None and facenet is not None) else "not_loaded"
     
     doc_count = None
     if collection is not None:
@@ -217,6 +229,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "database": db_status,
+        "models": model_status,
         "document_count": doc_count,
         "device": str(device),
         "mongodb_uri_set": bool(MONGODB_URI and MONGODB_URI != 'mongodb://localhost:27017/')
@@ -234,7 +247,16 @@ def verify_farmer():
             "error_code": "DB_NOT_INITIALIZED"
         }), 500
     
+    if mtcnn is None or facenet is None:
+        print("❌ Models not initialized")
+        return jsonify({
+            "verified": False,
+            "message": "Models not initialized",
+            "error_code": "MODELS_NOT_INITIALIZED"
+        }), 500
+    
     try:
+        start_time = datetime.now()
         data = request.get_json()
         
         if not data:
@@ -252,10 +274,13 @@ def verify_farmer():
         print(f"\n🔍 Verifying: {farm_name} | {rsbsa_no}")
         
         # Query database
+        query_start = datetime.now()
         farmer = collection.find_one({
             "farm_name": farm_name.strip(),
             "RSBSA_no": rsbsa_no.strip()
         })
+        query_time = (datetime.now() - query_start).total_seconds()
+        print(f"⏱️ DB query: {query_time:.2f}s")
         
         if not farmer:
             print("❌ Farmer not found")
@@ -275,6 +300,7 @@ def verify_farmer():
             }), 404
         
         # Process uploaded photo
+        decode_start = datetime.now()
         uploaded_image = decode_uploaded_photo(uploaded_photo_b64)
         if uploaded_image is None:
             return jsonify({
@@ -282,7 +308,11 @@ def verify_farmer():
                 "message": "Invalid uploaded photo",
                 "error_code": "INVALID_UPLOAD"
             }), 400
+        decode_time = (datetime.now() - decode_start).total_seconds()
+        print(f"⏱️ Decode upload: {decode_time:.2f}s")
         
+        # Extract uploaded face embedding
+        embed_start = datetime.now()
         uploaded_embedding = extract_face_embedding(uploaded_image)
         if uploaded_embedding is None:
             return jsonify({
@@ -290,8 +320,11 @@ def verify_farmer():
                 "message": "No face detected in uploaded photo",
                 "error_code": "NO_FACE_IN_UPLOAD"
             }), 400
+        embed_time = (datetime.now() - embed_start).total_seconds()
+        print(f"⏱️ Extract upload embedding: {embed_time:.2f}s")
         
         # Process stored photo
+        decrypt_start = datetime.now()
         stored_image = decrypt_farmer_photo(farmer['encryptedData']['encryptedContent'])
         if stored_image is None:
             return jsonify({
@@ -299,7 +332,11 @@ def verify_farmer():
                 "message": "Failed to decrypt stored photo",
                 "error_code": "DECRYPTION_FAILED"
             }), 500
+        decrypt_time = (datetime.now() - decrypt_start).total_seconds()
+        print(f"⏱️ Decrypt DB photo: {decrypt_time:.2f}s")
         
+        # Extract stored face embedding
+        stored_embed_start = datetime.now()
         stored_embedding = extract_face_embedding(stored_image)
         if stored_embedding is None:
             return jsonify({
@@ -307,13 +344,19 @@ def verify_farmer():
                 "message": "No face detected in stored photo",
                 "error_code": "NO_FACE_IN_DB"
             }), 500
+        stored_embed_time = (datetime.now() - stored_embed_start).total_seconds()
+        print(f"⏱️ Extract DB embedding: {stored_embed_time:.2f}s")
         
         # Compare faces
+        match_start = datetime.now()
         is_match, distance, confidence = is_face_match(stored_embedding, uploaded_embedding)
+        match_time = (datetime.now() - match_start).total_seconds()
+        print(f"⏱️ Face matching: {match_time:.2f}s")
         
+        total_time = (datetime.now() - start_time).total_seconds()
+        print(f"⏱️ TOTAL TIME: {total_time:.2f}s")
         print(f"📊 {'✅ MATCH' if is_match else '❌ NO MATCH'} (confidence: {confidence}%)")
         
-        # Convert NumPy types to native Python types for JSON serialization
         return jsonify({
             "verified": bool(is_match),
             "confidence": float(confidence) if confidence is not None else 0.0,
@@ -323,7 +366,8 @@ def verify_farmer():
             "rsbsa_no": str(rsbsa_no),
             "farmer_name": str(farmer.get('name', 'N/A')),
             "message": "Identity verified successfully" if is_match else "Identity verification failed",
-            "verified_at": datetime.utcnow().isoformat() + "Z"
+            "verified_at": datetime.utcnow().isoformat() + "Z",
+            "processing_time_seconds": round(total_time, 2)
         }), 200
         
     except Exception as e:
@@ -346,6 +390,14 @@ if __name__ == '__main__':
     
     if collection is None:
         print("❌ Cannot connect. Exiting...")
+        exit(1)
+    
+    if mtcnn is None or facenet is None:
+        print("❌ Attempting to reload models...")
+        initialize_models()
+    
+    if mtcnn is None or facenet is None:
+        print("❌ Cannot load models. Exiting...")
         exit(1)
     
     port = int(os.getenv('PORT', 8080))
